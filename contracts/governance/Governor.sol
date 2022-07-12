@@ -12,6 +12,7 @@ import "../utils/math/SafeCast.sol";
 import "../utils/structs/DoubleEndedQueue.sol";
 import "../utils/Address.sol";
 import "../utils/Context.sol";
+import "../utils/Counters.sol";
 import "../utils/Timers.sol";
 import "./IGovernor.sol";
 
@@ -30,16 +31,24 @@ abstract contract Governor is Context, ERC165, EIP712, IGovernor, IERC721Receive
     using DoubleEndedQueue for DoubleEndedQueue.Bytes32Deque;
     using SafeCast for uint256;
     using Timers for Timers.BlockNumber;
+    using Counters for Counters.Counter;
+
+    Counters.Counter public proposalIdCounter;
 
     bytes32 public constant BALLOT_TYPEHASH = keccak256("Ballot(uint256 proposalId,uint8 support)");
     bytes32 public constant EXTENDED_BALLOT_TYPEHASH =
         keccak256("ExtendedBallot(uint256 proposalId,uint8 support,string reason,bytes params)");
 
     struct ProposalCore {
+        uint256 hash;
         Timers.BlockNumber voteStart;
         Timers.BlockNumber voteEnd;
         bool executed;
         bool canceled;
+        address[] targets;
+        uint256[] values;
+        bytes[] calldatas;
+        string description;
     }
 
     string private _name;
@@ -115,65 +124,6 @@ abstract contract Governor is Context, ERC165, EIP712, IGovernor, IERC721Receive
      */
     function version() public view virtual override returns (string memory) {
         return "1";
-    }
-
-    /**
-     * @dev See {IGovernor-hashProposal}.
-     *
-     * The proposal id is produced by hashing the RLC encoded `targets` array, the `values` array, the `calldatas` array
-     * and the descriptionHash (bytes32 which itself is the keccak256 hash of the description string). This proposal id
-     * can be produced from the proposal data which is part of the {ProposalCreated} event. It can even be computed in
-     * advance, before the proposal is submitted.
-     *
-     * Note that the chainId and the governor address are not part of the proposal id computation. Consequently, the
-     * same proposal (with same operation and same description) will have the same id if submitted on multiple governors
-     * across multiple networks. This also means that in order to execute the same operation twice (on the same
-     * governor) the proposer will have to change the description in order to avoid proposal id conflicts.
-     */
-    function hashProposal(
-        address[] memory targets,
-        uint256[] memory values,
-        bytes[] memory calldatas,
-        bytes32 descriptionHash
-    ) public pure virtual override returns (uint256) {
-        return uint256(keccak256(abi.encode(targets, values, calldatas, descriptionHash)));
-    }
-
-    /**
-     * @dev See {IGovernor-state}.
-     */
-    function state(uint256 proposalId) public view virtual override returns (ProposalState) {
-        ProposalCore storage proposal = _proposals[proposalId];
-
-        if (proposal.executed) {
-            return ProposalState.Executed;
-        }
-
-        if (proposal.canceled) {
-            return ProposalState.Canceled;
-        }
-
-        uint256 snapshot = proposalSnapshot(proposalId);
-
-        if (snapshot == 0) {
-            revert("Governor: unknown proposal id");
-        }
-
-        if (snapshot >= block.number) {
-            return ProposalState.Pending;
-        }
-
-        uint256 deadline = proposalDeadline(proposalId);
-
-        if (deadline >= block.number) {
-            return ProposalState.Active;
-        }
-
-        if (_quorumReached(proposalId) && _voteSucceeded(proposalId)) {
-            return ProposalState.Succeeded;
-        } else {
-            return ProposalState.Defeated;
-        }
     }
 
     /**
@@ -253,7 +203,8 @@ abstract contract Governor is Context, ERC165, EIP712, IGovernor, IERC721Receive
             "Governor: proposer votes below proposal threshold"
         );
 
-        uint256 proposalId = hashProposal(targets, values, calldatas, keccak256(bytes(description)));
+        uint256 proposalId = proposalIdCounter.current();
+        proposalIdCounter.increment();
 
         require(targets.length == values.length, "Governor: invalid proposal length");
         require(targets.length == calldatas.length, "Governor: invalid proposal length");
@@ -267,6 +218,11 @@ abstract contract Governor is Context, ERC165, EIP712, IGovernor, IERC721Receive
 
         proposal.voteStart.setDeadline(snapshot);
         proposal.voteEnd.setDeadline(deadline);
+
+        proposal.targets = targets;
+        proposal.values = values;
+        proposal.calldatas = calldatas;
+        proposal.description = description;
 
         emit ProposalCreated(
             proposalId,
@@ -287,12 +243,8 @@ abstract contract Governor is Context, ERC165, EIP712, IGovernor, IERC721Receive
      * @dev See {IGovernor-execute}.
      */
     function execute(
-        address[] memory targets,
-        uint256[] memory values,
-        bytes[] memory calldatas,
-        bytes32 descriptionHash
+        uint256 proposalId /* proposalId */
     ) public payable virtual override returns (uint256) {
-        uint256 proposalId = hashProposal(targets, values, calldatas, descriptionHash);
 
         ProposalState status = state(proposalId);
         require(
@@ -303,9 +255,9 @@ abstract contract Governor is Context, ERC165, EIP712, IGovernor, IERC721Receive
 
         emit ProposalExecuted(proposalId);
 
-        _beforeExecute(proposalId, targets, values, calldatas, descriptionHash);
-        _execute(proposalId, targets, values, calldatas, descriptionHash);
-        _afterExecute(proposalId, targets, values, calldatas, descriptionHash);
+        _beforeExecute(proposalId, _proposals[proposalId].targets, _proposals[proposalId].values, _proposals[proposalId].calldatas, _proposals[proposalId].descriptionHash);
+        _execute(proposalId, _proposals[proposalId].targets, _proposals[proposalId].values, _proposals[proposalId].calldatas, _proposals[proposalId].descriptionHash);
+        _afterExecute(proposalId, _proposals[proposalId].targets, _proposals[proposalId].values, _proposals[proposalId].calldatas, _proposals[proposalId].descriptionHash);
 
         return proposalId;
     }
